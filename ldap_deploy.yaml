@@ -1,0 +1,225 @@
+---
+- name: Bootstrap ldap
+  hosts: all
+  become: true
+  tasks:
+    - name: Install OpenLDAP packages
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - slapd
+        - ldap-utils
+
+    - name: Start and enable OpenLDAP service
+      service:
+        name: slapd
+        state: started
+        enabled: true
+
+    - name: Change database password
+      command: ldapmodify -Y EXTERNAL -H ldapi:/// -f <path-newpasswd.ldif>
+
+    - name: Create tls ldif
+      copy:
+        dest: "/tmp/tls_config.ldif"
+        content: |
+          # THE ORDER IS IMPORTANT
+          dn: cn=config
+          add: olcTLSCACertificateFile
+          olcTLSCACertificateFile: /etc/ssl/certs/mycacert.pem
+          -
+          add: olcTLSCertificateKeyFile
+          olcTLSCertificateKeyFile: /etc/ldap/{{ inventory_hostname  }}_key.pem
+          -
+          add: olcTLSCertificateFile
+          olcTLSCertificateFile: /etc/ldap/{{ inventory_hostname }}_cert.pem
+
+    - name: Change key ownership
+      file:
+        path: /etc/ldap/{{ inventory_hostname }}_key.pem
+        owner: root
+        group: openldap
+        mode: 0640
+
+    - name: TLS config
+      command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/tls_config.ldif
+
+    - name: Create replicator user ldif
+      copy:
+        dest: "/tmp/replicator_user.ldif"
+        content: |
+          dn: cn=replicator,dc=example,dc=com
+          objectClass: simpleSecurityObject
+          objectClass: organizationalRole
+          cn: replicator
+          description: Replication user
+          userPassword: {SSHA}<create-password>
+
+    - name: Add replicator user
+      command: ldapadd -x -ZZ -D cn=admin,dc=example,dc=com -w <change-with-admin-password> -f /tmp/replicator_user.ldif
+
+    - name: Create replicator acl limits ldif
+      copy:
+        dest: "/tmp/replicator_acl.ldif"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          add: olcAccess
+          olcAccess: {0}to *
+            by dn.exact="cn=replicator,dc=example,dc=com" read
+            by * break
+          -
+          add: olcLimits
+          olcLimits: dn.exact="cn=replicator,dc=example,dc=com"
+            time.soft=unlimited time.hard=unlimited
+            size.soft=unlimited size.hard=unlimited
+
+    - name: Add replicator acl
+      command: ldapmodify -Q -Y EXTERNAL -H ldapi:/// -f /tmp/replicator_acl.ldif
+
+    - name: Create module sync ldif
+      copy:
+        dest: "/tmp/mod_syncprov.ldif"
+        content: |
+          # Add indexes to the frontend db.
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          add: olcDbIndex
+          olcDbIndex: entryCSN eq
+          -
+          add: olcDbIndex
+          olcDbIndex: entryUUID eq
+
+          #Load the syncprov module.
+          dn: cn=module{0},cn=config
+          changetype: modify
+          add: olcModuleLoad
+          olcModuleLoad: syncprov
+
+    - name: Add module sync
+      command: ldapmodify -Q -Y EXTERNAL -H ldapi:/// -f /tmp/mod_syncprov.ldif
+
+    - name: Create syncrepl provider ldif
+      copy:
+        dest: "/tmp/syncprov.ldif"
+        content: |
+          dn: olcOverlay=syncprov,olcDatabase={1}mdb,cn=config
+          changetype: add
+          objectClass: olcOverlayConfig
+          objectClass: olcSyncProvConfig
+          olcOverlay: syncprov
+          olcSpCheckpoint: 100 10
+          olcSpSessionLog: 1000
+
+    - name: Add syncrepl provider
+      command: ldapmodify -Q -Y EXTERNAL -H ldapi:/// -f /tmp/syncprov.ldif
+
+    - name: Create provider setup node1 ldif
+      copy:
+        dest: "/tmp/provider_ldap-1.ldif"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcServerID
+          olcServerID: 1
+
+          dn: cn=config
+          changetype: modify
+          replace: olcServerID
+          olcServerID: 1 ldap://ldap-1.example.com
+          olcServerID: 2 ldap://ldap-2.example.com
+          olcServerID: 3 ldap://ldap-3.example.com
+
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          add: olcSyncRepl
+          olcSyncRepl: rid=001 provider=ldap://ldap-1.example.com binddn="cn=replicator,dc=example,dc=com" bindmethod=simple
+            credentials=<change-to-replicator-password> searchbase="dc=example,dc=com" type=refreshAndPersist
+            retry="5 5 300 5" timeout=1
+          olcSyncRepl: rid=002 provider=ldap://ldap-2.example.com binddn="cn=replicator,dc=example,dc=com" bindmethod=simple
+            credentials=<change-to-replicator-password> searchbase="dc=example,dc=com" type=refreshAndPersist
+            retry="5 5 300 5" timeout=1
+          olcSyncRepl: rid=003 provider=ldap://ldap-3.example.com binddn="cn=replicator,dc=example,dc=com" bindmethod=simple
+            credentials=<change-to-replicator-password> searchbase="dc=example,dc=com" type=refreshAndPersist
+            retry="5 5 300 5" timeout=1
+          -
+          add: olcMirrorMode
+          olcMirrorMode: TRUE
+      when: inventory_hostname in groups["master"]
+
+    - name: Create provider setup node2 ldif
+      copy:
+        dest: "/tmp/provider_ldap-2.ldif"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcServerID
+          olcServerID: 2
+
+          dn: cn=config
+          changetype: modify
+          replace: olcServerID
+          olcServerID: 1 ldap://ldap-1.example.com
+          olcServerID: 2 ldap://ldap-2.example.com
+          olcServerID: 3 ldap://ldap-3.example.com
+
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          add: olcSyncRepl
+          olcSyncRepl: rid=001 provider=ldap://ldap-1.example.com binddn="cn=replicator,dc=example,dc=com" bindmethod=simple
+            credentials=<change-to-replicator-password> searchbase="dc=example,dc=com" type=refreshAndPersist
+            retry="5 5 300 5" timeout=1
+          olcSyncRepl: rid=002 provider=ldap://ldap-2.example.com binddn="cn=replicator,dc=example,dc=com" bindmethod=simple
+            credentials=<change-to-replicator-password> searchbase="dc=example,dc=com" type=refreshAndPersist
+            retry="5 5 300 5" timeout=1
+          olcSyncRepl: rid=003 provider=ldap://ldap-3.example.com binddn="cn=replicator,dc=example,dc=com" bindmethod=simple
+            credentials=<change-to-replicator-password> searchbase="dc=example,dc=com" type=refreshAndPersist
+            retry="5 5 300 5" timeout=1
+          -
+          add: olcMirrorMode
+          olcMirrorMode: TRUE
+      when: inventory_hostname in groups["master"]
+
+    - name: Create provider setup node3 ldif
+      copy:
+        dest: "/tmp/provider_ldap-3.ldif"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcServerID
+          olcServerID: 3
+
+          dn: cn=config
+          changetype: modify
+          replace: olcServerID
+          olcServerID: 1 ldap://ldap-1.example.com
+          olcServerID: 2 ldap://ldap-2.example.com
+          olcServerID: 3 ldap://ldap-3.example.com
+
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          add: olcSyncRepl
+          olcSyncRepl: rid=001 provider=ldap://ldap-1.example.com binddn="cn=replicator,dc=example,dc=com" bindmethod=simple
+            credentials=<change-to-replicator-password> searchbase="dc=example,dc=com" type=refreshAndPersist
+            retry="5 5 300 5" timeout=1
+          olcSyncRepl: rid=002 provider=ldap://ldap-2.example.com binddn="cn=replicator,dc=example,dc=com" bindmethod=simple
+            credentials=<change-to-replicator-password> searchbase="dc=example,dc=com" type=refreshAndPersist
+            retry="5 5 300 5" timeout=1
+          olcSyncRepl: rid=003 provider=ldap://ldap-3.example.com binddn="cn=replicator,dc=example,dc=com" bindmethod=simple
+            credentials=<change-to-replicator-password> searchbase="dc=example,dc=com" type=refreshAndPersist
+            retry="5 5 300 5" timeout=1
+          -
+          add: olcMirrorMode
+          olcMirrorMode: TRUE
+      when: inventory_hostname in groups["master"]
+
+    - name: Copy provider setup ldif
+      copy:
+        src: /tmp/provider_{{ inventory_hostname }}.ldif
+        dest: /tmp/provider_{{ inventory_hostname }}.ldif
+        owner: root
+        group: root
+
+    - name: Add provider setup
+      command: ldapmodify -Q -Y EXTERNAL -H ldapi:/// -f /tmp/provider_{{ inventory_hostname }}.ldif

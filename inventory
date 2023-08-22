@@ -1,0 +1,6 @@
+[master]
+ldap-1
+
+[consumers]
+ldap-2
+ldap-3
